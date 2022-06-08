@@ -59,13 +59,47 @@ void put_item(Buffer* buffer, int item)
     buffer->in = (buffer->in + 1) % CAPACITY;
 }
 
+/* 信号量数据结构定义 */
+// 数据结构
+typedef struct Sema
+{
+    int value;                  /* 资源数量 */
+    pthread_mutex_t mutex;      /* 互斥量 */
+    pthread_cond_t cond;        /* 条件变量 */
+} Sema ;
+// 1. 初始化
+void sema_init(Sema* sema, int value)
+{
+    sema->value = value;
+    pthread_mutex_init(&sema->mutex, NULL);
+    pthread_cond_init(&sema->cond, NULL);
+}
+// 2. 等待
+void sema_wait(Sema* sema)
+{
+    pthread_mutex_lock(&sema->mutex);
+    while ( sema->value <= 0)
+    {
+        pthread_cond_wait(&sema->cond, &sema->mutex);
+    }
+    sema->value--;
+    pthread_mutex_unlock(&sema->mutex);
+}
+// 3. 唤醒
+void sema_signal(Sema* sema)
+{
+    pthread_mutex_lock(&sema->mutex);
+    sema->value++;
+    pthread_cond_signal(&sema->cond);
+    pthread_mutex_unlock(&sema->mutex);
+}
+
 // 两个Buffer
 Buffer buffer1, buffer2;
-
-/* 临界区 条件变量定义 */
-pthread_mutex_t mutex1, mutex2;                                             /* 两个Buffer分配两个临界区 */
-pthread_cond_t wait_empty_buffer1, wait_empty_buffer2;                      /* Buffer对应的 为空 条件 */
-pthread_cond_t wait_full_buffer1, wait_full_buffer2;                        /* Buffer对应的 为满 条件 */
+// 信号量
+Sema mutex_buffer1_sema, mutex_buffer2_sema;                                /* buffer1 2 互斥量 */
+Sema full_buffer1_sema, empty_buffer1_sema;                                 /* 满/空 buffer1 信号量 */
+Sema full_buffer2_sema, empty_buffer2_sema;                                 /* 满/空 buffer2 信号量 */
 
 /* 生产者 计算者 消费者 线程函数 */
 #define ITEM_COUNT (CAPACITY * 2)
@@ -73,18 +107,18 @@ pthread_cond_t wait_full_buffer1, wait_full_buffer2;                        /* B
 // 生产数据到 buffer1
 void* produce(void* arg)
 {
-    int i， item;
+    int i, item;
     for (i = 0; i < ITEM_COUNT; i++) {
-        pthread_mutex_lock(&mutex1);                                        /* LOCK MUTEX1 */
-        while (buffer_is_full(&buffer1))                                    /* 等待 buffer1 不满 */
-            pthread_cond_wait(&wait_empty_buffer1, &mutex1);
-
-        item = 'a' + i;                                                     /* 生产 */
+        // 等待
+        sema_wait(&empty_buffer1_sema);                                     /* 等待buffer1中的一个空项 */
+        sema_wait(&mutex_buffer1_sema);                                     /* LOCK buffer1 */
+        // 写入数据
+        item = i + 'a';
         put_item(&buffer1, item);
         printf("produce item: %c\n", item);
-
-        pthread_cond_signal(&wait_full_buffer1);                            /* SIGNAL buffer1 满 */
-        pthread_mutex_unlock(&mutex1);                                      /* UNLOCK MUTEX1 */
+        // 释放
+        sema_signal(&mutex_buffer1_sema);                                   /* UNLOCK buffer1 */
+        sema_signal(&full_buffer1_sema);                                     /* 唤醒一个等待buffer1满项的线程 */
     }
     return NULL;
 }
@@ -96,25 +130,29 @@ void* calculate(void* arg)
     
     for (i = 0; i < ITEM_COUNT; i++) {
         // 取数据部分
-        pthread_mutex_lock(&mutex1);                                        /* LOCK MUTEX1 */
-        while (buffer_is_empty(&buffer1))                                   /* 等待 buffer1 不空 */
-            pthread_cond_wait(&wait_full_buffer1, &mutex1);
-        item = get_item(&buffer1);                                          /* 获取数据 */
+        // 等待
+        sema_wait(&full_buffer1_sema);                                     /* 等待buffer1中的一个满项 */
+        sema_wait(&mutex_buffer1_sema);                                     /* LOCK buffer1 */
+        // 取出数据
+        item = get_item(&buffer1);
         printf("    calculate get item: %c\n", item);
-        pthread_cond_signal(&wait_empty_buffer1);                           /* SIGNAL buffer1 空 */
-        pthread_mutex_unlock(&mutex1);                                      /* UNLOCK MUTEX1 */
+        // 释放
+        sema_signal(&mutex_buffer1_sema);                                   /* UNLOCK buffer1 */
+        sema_signal(&empty_buffer1_sema);                                    /* 唤醒一个等待buffer1空项的线程 */
 
         // 计算部分
         item = item + 'A' - 'a';
 
         // 放数据部分
-        pthread_mutex_lock(&mutex2);                                        /* LOCK MUTEX2 */
-        while (buffer_is_full(&buffer2))                                    /* 等待buffer2不满 */
-            pthread_cond_wait(&wait_empty_buffer2, &mutex2);        
-        put_item(&buffer2, item);                                           /* 放数据 */
+        // 等待
+        sema_wait(&empty_buffer2_sema);                                         /* 等待buffer2中的一个空项 */
+        sema_wait(&mutex_buffer2_sema);                                         /* LOCK buffer2 */
+        // 放入数据
+        put_item(&buffer2, item);
         printf("    calculate put item: %c\n", item);
-        pthread_cond_signal(&wait_full_buffer2);                            /* SIGNAL buffer2 有数据 */
-        pthread_mutex_unlock(&mutex2);                                      /* UNLOCK MUTEX2 */
+        // 释放
+        sema_signal(&mutex_buffer2_sema);                                       /* UNLOCK buffer2 */
+        sema_signal(&full_buffer2_sema);                                        /* 唤醒一个等待buffer2满项的线程 */
     }
     return NULL;
 }
@@ -125,15 +163,15 @@ void* consume(void* arg)
     int item;
 
     for (i = 0; i < ITEM_COUNT; i++) {
-        pthread_mutex_lock(&mutex2);
-        while (buffer_is_empty(&buffer2))
-            pthread_cond_wait(&wait_full_buffer2, &mutex2);
-
+         // 等待
+        sema_wait(&full_buffer2_sema);                                      /* 等待buffer2中的一个满项 */
+        sema_wait(&mutex_buffer2_sema);                                     /* LOCK buffer2 */
+        // 取出数据
         item = get_item(&buffer2);
         printf("        consume item: %c\n", item);
-
-        pthread_cond_signal(&wait_empty_buffer2);
-        pthread_mutex_unlock(&mutex2);
+        // 释放
+        sema_signal(&mutex_buffer2_sema);                                   /* UNLOCK buffer2 */
+        sema_signal(&empty_buffer2_sema);                                    /* 唤醒一个等待buffer2空项的线程 */
     }
     return NULL;
 }
@@ -147,13 +185,14 @@ int main()
     buffer_init(&buffer2);
     // 线程ID
     pthread_t calculater_tid, consumer_tid;
-    // 初始化 互斥量 条件变量
-    pthread_mutex_init(&mutex1, NULL);
-    pthread_mutex_init(&mutex2, NULL);
-    pthread_cond_init(&wait_empty_buffer1, NULL);
-    pthread_cond_init(&wait_empty_buffer2, NULL);
-    pthread_cond_init(&wait_full_buffer1, NULL);
-    pthread_cond_init(&wait_full_buffer2, NULL);
+    // 初始化 信号量
+    sema_init(&mutex_buffer1_sema, 1);
+    sema_init(&empty_buffer1_sema, CAPACITY - 1);
+    sema_init(&full_buffer1_sema, 0);
+
+    sema_init(&mutex_buffer2_sema, 1);
+    sema_init(&empty_buffer2_sema, CAPACITY - 1);
+    sema_init(&full_buffer2_sema, 0);
 
     // 创建子线程执行 计算者、消费者， 主线程执行生产者
     pthread_create(&calculater_tid, NULL, calculate, NULL);
